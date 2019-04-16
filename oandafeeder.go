@@ -3,9 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
-	"os"
 	"sort"
 	"strconv"
 	"time"
@@ -17,7 +15,6 @@ import (
 	"github.com/alpacahq/marketstore/utils/io"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/joho/godotenv"
 	goa "github.com/mg64ve/goanda"
 )
 
@@ -49,6 +46,8 @@ type OandaFetcher struct {
 	symbols       []string
 	queryStart    time.Time
 	baseTimeframe *utils.Timeframe
+        oandaUser     string
+        oandaToken    string
 }
 
 func recast(config map[string]interface{}) *FetcherConfig {
@@ -88,11 +87,15 @@ func NewBgWorker(conf map[string]interface{}) (bgworker.BgWorker, error) {
 	if config.BaseTimeframe != "" {
 		timeframeStr = config.BaseTimeframe
 	}
+        oandaUser := config.User
+        oandaToken := config.Token
 	return &OandaFetcher{
 		config:        conf,
 		symbols:       symbols,
 		queryStart:    queryStart,
 		baseTimeframe: utils.NewTimeframe(timeframeStr),
+                oandaUser:     oandaUser,
+                oandaToken:    oandaToken,
 	}, nil
 }
 
@@ -126,13 +129,12 @@ func (oa *OandaFetcher) Run() {
 
 	symbols := oa.symbols
 	numBars := time.Duration(4999)
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	key := os.Getenv("OANDA_API_KEY")
-	accountID := os.Getenv("OANDA_ACCOUNT_ID")
+
+	key := oa.oandaToken
+	accountID := oa.oandaUser
+
 	client := goa.NewConnection(accountID, key, false)
+
 	timeStart = time.Time{}
 	for _, symbol := range symbols {
 		tbk := io.NewTimeBucketKey(symbol + "/" + oa.baseTimeframe.String + "/OHLCV")
@@ -229,12 +231,6 @@ func (oa *OandaFetcher) Run() {
 		}
 	}
 }
-
-func getConfig(data string) (ret map[string]interface{}) {
-        json.Unmarshal([]byte(data), &ret)
-        return
-}
-
 
 func main() {
 
