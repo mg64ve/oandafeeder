@@ -33,6 +33,8 @@ Add the following to your config file:
 bgworkers:
   - module: gdaxfeeder.so
     config:
+      user: YOUR_OANDA_USER
+      token: YOUR_OANDA_TOKEN
       query_start: "2018-01-01 00:00"
       symbols:
         - EUR_USD

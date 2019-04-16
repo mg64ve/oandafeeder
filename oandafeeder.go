@@ -7,8 +7,8 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strconv"
 	"time"
-	//"strconv"
 
 	"github.com/alpacahq/marketstore/executor"
 	"github.com/alpacahq/marketstore/planner"
@@ -16,31 +16,12 @@ import (
 	"github.com/alpacahq/marketstore/utils"
 	"github.com/alpacahq/marketstore/utils/io"
 
-	goa "github.com/awoldes/goanda"
-	//goa "/home/marco/go/src/github.com/awoldes/goanda"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/joho/godotenv"
+	goa "github.com/mg64ve/goanda"
 )
 
 type ByTime []goa.Candles
-
-/*
-type OInstrumentHistory struct {
-     goa.InstrumentHistory
-}
-type OConnection struct {
-     goa.OandaConnection
-}
-
-
-func (c *OConnection) GetCandlesFromTime(instrument string, from string, to string, granularity string) OInstrumentHistory {
-        endpoint := "/instruments/" + instrument + "/candles?from=" + from + "&to=" + to + "&granularity=" + granularity
-        candles := c.Request(endpoint)
-        data := OInstrumentHistory{}
-        json.Unmarshal(candles, &data)
-
-        return data
-}
-*/
 
 func (a ByTime) Len() int           { return len(a) }
 func (a ByTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
@@ -57,6 +38,9 @@ type FetcherConfig struct {
 	QueryStart string `json:"query_start"`
 	// such as 5Min, 1D.  defaults to 1Min
 	BaseTimeframe string `json:"base_timeframe"`
+        // User/Toker for Oanda API
+	User string `json:"user"`
+	Token string `json:"token"`
 }
 
 // OandaFetcher is the main worker instance.  It implements bgworker.Run().
@@ -137,7 +121,11 @@ func findLastTimestamp(symbol string, tbk *io.TimeBucketKey) time.Time {
 // Run() runs forever to get public historical rate for each configured symbol,
 // and writes in marketstore data format.
 func (oa *OandaFetcher) Run() {
+	var rates []goa.Candles
+	var endTime, timeEnd, timeStart, lastTime time.Time
+
 	symbols := oa.symbols
+	numBars := time.Duration(4999)
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
@@ -145,7 +133,7 @@ func (oa *OandaFetcher) Run() {
 	key := os.Getenv("OANDA_API_KEY")
 	accountID := os.Getenv("OANDA_ACCOUNT_ID")
 	client := goa.NewConnection(accountID, key, false)
-	timeStart := time.Time{}
+	timeStart = time.Time{}
 	for _, symbol := range symbols {
 		tbk := io.NewTimeBucketKey(symbol + "/" + oa.baseTimeframe.String + "/OHLCV")
 		lastTimestamp := findLastTimestamp(symbol, tbk)
@@ -162,26 +150,34 @@ func (oa *OandaFetcher) Run() {
 		}
 	}
 	for {
-		timeEnd := timeStart.Add(oa.baseTimeframe.Duration * 300)
-		lastTime := timeStart
+		timeEnd = timeStart.Add(oa.baseTimeframe.Duration * numBars)
+		lastTime = timeStart
+		endTime = time.Now()
 		for _, symbol := range symbols {
-			//granularity := strconv.FormatFloat(goa.baseTimeframe.Duration.Seconds(), 'E', -1, 64)
-			granularity := "M1"
-			fmt.Printf("Requesting %s %v - %v\n", symbol, timeStart, timeEnd)
-			numBars := "5000"
-			//rates, err := client.GetCandlesFromTime(symbol, timeStart, timeEnd, granularity)
-			his := client.GetCandles(symbol, numBars, granularity)
-			rates := his.Candles
-			/*
-				if err != nil {
-					fmt.Printf("Response error: %v\n", err)
-					// including rate limit case
-					time.Sleep(time.Minute)
-					continue
-				}
-			*/
+			granularity := "D"
+			switch oa.baseTimeframe.Duration.Seconds() {
+			case 60:
+				granularity = "M1"
+			case 300:
+				granularity = "M5"
+			case 3600:
+				granularity = "H1"
+			default:
+				granularity = "D"
+			}
+
+			fmt.Printf("Requesting %s %v - %v (Using granularity: %s)\n", symbol, timeStart, timeEnd, granularity)
+			ts := timeStart.Unix()
+			te := timeEnd.Unix()
+			time_s := strconv.FormatInt(ts, 10)
+			time_e := strconv.FormatInt(te, 10)
+			fmt.Printf("Calling Oanda for %s, from: %s, to: %s, granularity: %s\n", symbol, time_s, time_e, granularity)
+			his := client.GetCandlesFromTime(symbol, time_s, time_e, granularity)
+			rates = his.Candles
+			//spew.Dump(rates)
 			if len(rates) == 0 {
 				fmt.Printf("len(rates) == 0\n")
+				time.Sleep(time.Minute)
 				continue
 			}
 			epoch := make([]int64, 0)
@@ -209,17 +205,18 @@ func (oa *OandaFetcher) Run() {
 			cs.AddColumn("Low", low)
 			cs.AddColumn("Close", close)
 			cs.AddColumn("Volume", volume)
+			endTime = rates[(len(rates))-1].Time
 			fmt.Printf("%s: %d rates between %v - %v\n", symbol, len(rates),
 				rates[0].Time, rates[(len(rates))-1].Time)
 			csm := io.NewColumnSeriesMap()
 			tbk := io.NewTimeBucketKey(symbol + "/" + oa.baseTimeframe.String + "/OHLCV")
 			csm.AddColumnSeries(*tbk, cs)
-			executor.WriteCSM(csm, false)
+			executor.WriteCSM(csm, true)
 		}
 		// next fetch start point
-		timeStart = lastTime.Add(oa.baseTimeframe.Duration)
+		timeStart = endTime
 		// for the next bar to complete, add it once more
-		nextExpected := timeStart.Add(oa.baseTimeframe.Duration)
+		nextExpected := timeStart.Add(oa.baseTimeframe.Duration * numBars)
 		now := time.Now()
 		toSleep := nextExpected.Sub(now)
 		fmt.Printf("next expected(%v) - now(%v) = %v\n", nextExpected, now, toSleep)
@@ -233,20 +230,52 @@ func (oa *OandaFetcher) Run() {
 	}
 }
 
+func getConfig(data string) (ret map[string]interface{}) {
+        json.Unmarshal([]byte(data), &ret)
+        return
+}
+
+
 func main() {
 
-	//timeStart := time.Date(2017, 12, 1, 0, 0, 0, 0, time.UTC)
-	//timeEnd := time.Date(2017, 12, 1, 1, 0, 0, 0, time.UTC)
-	granularity := "M1"
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	key := os.Getenv("OANDA_API_KEY")
-	accountID := os.Getenv("OANDA_ACCOUNT_ID")
+
+	key := "YOUR_OANDA_TOKEN"
+	accountID := "YOUR_OANDA_USER"
+	symbol := "EUR_USD"
+
 	client := goa.NewConnection(accountID, key, false)
-	//res, err := client.GetCandlesFromTime("EUR_USD", timeStart, timeEnd, granularity)
-	numBars := "5000"
-	res := client.GetCandles("EUR_USD", numBars, granularity)
-	fmt.Println(res)
+
+	var rates []goa.Candles
+	numBars := time.Duration(4999)
+	granularity := "M1"
+	timeStart := time.Date(2017, 12, 1, 0, 0, 0, 0, time.UTC)
+	timeEnd := timeStart.Add(time.Minute * numBars)
+	ts := timeStart.Unix()
+	te := timeEnd.Unix()
+	time_s := strconv.FormatInt(ts, 10)
+	time_e := strconv.FormatInt(te, 10)
+	fmt.Printf("Requesting %s %v - %v (Using granularity: %s)\n", symbol, timeStart, timeEnd, granularity)
+	history := client.GetCandlesFromTime(symbol, time_s, time_e, granularity)
+	rates = history.Candles
+        r := rates[0]
+	fmt.Printf("r: %v, %v\n", r.Time, r.Mid.Low)
+	spew.Dump(rates)
+	fmt.Printf("len(rates) == %d\n", len(rates))
+
+	// test loop
+	for i := 0; i < 20; i++ {
+		timeStart = rates[(len(rates))-1].Time
+		timeEnd := timeStart.Add(time.Minute * numBars)
+		fmt.Printf("%s: between %v - %v\n", symbol, timeStart, timeEnd)
+		ts := timeStart.Unix()
+		te := timeEnd.Unix()
+		time_s := strconv.FormatInt(ts, 10)
+		time_e := strconv.FormatInt(te, 10)
+		fmt.Printf("Requesting %s %v - %v (Using granularity: %s)\n", symbol, timeStart, timeEnd, granularity)
+		history := client.GetCandlesFromTime(symbol, time_s, time_e, granularity)
+		rates = history.Candles
+		//spew.Dump(rates)
+		fmt.Printf("len(rates) == %d\n", len(rates))
+	}
+
 }
